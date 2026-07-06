@@ -129,6 +129,70 @@ jobs:
         # The dedicated `bundle` job below exercises the embed pipeline.
         run: cargo test --no-default-features --features test-support -- --test-threads=4 --nocapture
 
+  # Exercises the in-process FFI transport (`Transport::InProcess`, the Rust
+  # analogue of the .NET `RuntimeConnection.ForInProcess()`), mirroring the
+  # `inprocess` transport cell in dotnet-sdk-tests.yml. Sets
+  # COPILOT_SDK_DEFAULT_CONNECTION=inprocess so the client hosts the runtime
+  # cdylib in-process instead of spawning a stdio child, then runs the
+  # dedicated in-process E2E test.
+  test-inprocess:
+    name: "Rust SDK Tests (in-process transport)"
+    if: github.event.repository.fork == false
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - uses: ./.github/actions/setup-copilot
+        id: setup-copilot
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "rust"
+          prefix-key: v1-rust-no-bin
+          cache-bin: false
+
+      - name: Read pinned @github/copilot CLI version
+        id: cli-version
+        working-directory: ./nodejs
+        run: |
+          version=$(node -p "require('./package-lock.json').packages['node_modules/@github/copilot'].version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Pinned CLI version: $version"
+
+      - name: Cache bundled CLI tarball
+        uses: actions/cache@v4
+        with:
+          path: ./rust/.bundled-cli-cache
+          key: bundled-cli-ubuntu-latest-${{ steps.cli-version.outputs.version }}
+
+      - name: Install test harness dependencies
+        working-directory: ./test/harness
+        run: npm ci --ignore-scripts
+
+      - name: Select in-process transport
+        run: echo "COPILOT_SDK_DEFAULT_CONNECTION=inprocess" >> "$GITHUB_ENV"
+
+      - name: cargo test (in-process transport)
+        timeout-minutes: 60
+        env:
+          RUST_E2E_CONCURRENCY: 4
+          COPILOT_HMAC_KEY: ${{ secrets.COPILOT_DEVELOPER_CLI_INTEGRATION_HMAC_KEY }}
+          COPILOT_CLI_PATH: ${{ steps.setup-copilot.outputs.cli-path }}
+          BUNDLED_CLI_CACHE_DIR: ${{ github.workspace }}/rust/.bundled-cli-cache
+        run: cargo test --no-default-features --features test-support --test e2e inprocess -- --nocapture
+
   # Validates the bundled-CLI build path on all three supported
   # platforms. While the regular `cargo test` job above also exercises
   # build.rs (bundling is on by default now), this matrix job is the

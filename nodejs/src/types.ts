@@ -96,6 +96,7 @@ export interface TelemetryConfig {
  */
 export type RuntimeConnection =
     | StdioRuntimeConnection
+    | InProcessRuntimeConnection
     | TcpRuntimeConnection
     | UriRuntimeConnection;
 
@@ -109,6 +110,16 @@ export interface StdioRuntimeConnection {
     readonly path?: string;
     /** Extra command-line arguments to pass to the runtime process. */
     readonly args?: readonly string[];
+}
+
+/**
+ * Hosts the runtime in-process by loading the native runtime library and speaking
+ * JSON-RPC over its C ABI (FFI), instead of spawning a runtime child process. The
+ * native host spawns the CLI worker itself. Construct via
+ * {@link RuntimeConnection.forInProcess}.
+ */
+export interface InProcessRuntimeConnection {
+    readonly kind: "inprocess";
 }
 
 /**
@@ -182,6 +193,15 @@ export const RuntimeConnection = {
      */
     forUri(url: string, opts: { connectionToken?: string } = {}): UriRuntimeConnection {
         return { kind: "uri", url, connectionToken: opts.connectionToken };
+    },
+    /**
+     * Host the runtime in-process over the native runtime library's C ABI (FFI).
+     * The native host spawns the CLI worker itself; the SDK does not launch a
+     * runtime child process. Honors `COPILOT_CLI_PATH` for the CLI entrypoint,
+     * otherwise resolves the bundled platform package.
+     */
+    forInProcess(): InProcessRuntimeConnection {
+        return { kind: "inprocess" };
     },
 } as const;
 

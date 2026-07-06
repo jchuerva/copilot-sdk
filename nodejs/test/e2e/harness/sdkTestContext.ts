@@ -102,11 +102,17 @@ export async function createSdkTestContext({
         } else {
             connection = userConn;
         }
+    } else if (useStdio === false) {
+        connection = RuntimeConnection.forTcp({ path: cliPath });
+    } else if (
+        useStdio === undefined &&
+        (process.env.COPILOT_SDK_DEFAULT_CONNECTION ?? "").toLowerCase() === "inprocess"
+    ) {
+        // The in-process FFI transport resolves the CLI entrypoint itself
+        // (COPILOT_CLI_PATH or the bundled platform package), so no path is passed.
+        connection = RuntimeConnection.forInProcess();
     } else {
-        connection =
-            useStdio === false
-                ? RuntimeConnection.forTcp({ path: cliPath })
-                : RuntimeConnection.forStdio({ path: cliPath });
+        connection = RuntimeConnection.forStdio({ path: cliPath });
     }
 
     const {

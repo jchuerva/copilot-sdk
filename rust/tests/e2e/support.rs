@@ -170,6 +170,24 @@ impl E2eContext {
             .expect("start E2E client")
     }
 
+    /// Start a client that hosts the runtime in-process over FFI
+    /// ([`Transport::InProcess`]). Unlike the stdio harness, the CLI
+    /// entrypoint is passed as the program directly (the FFI host builds the
+    /// `node <entrypoint> --embedded-host` argv itself and loads the sibling
+    /// runtime cdylib), so a `.js` entrypoint is not split into node +
+    /// prefix_args here.
+    pub async fn start_inprocess_client(&self) -> Client {
+        let options = ClientOptions::new()
+            .with_cwd(self.work_dir.path())
+            .with_env(self.environment())
+            .with_use_logged_in_user(false)
+            .with_program(CliProgram::Path(self.cli_path.clone()))
+            .with_transport(Transport::InProcess);
+        Client::start(options)
+            .await
+            .expect("start in-process FFI E2E client")
+    }
+
     /// Start a client wired to a Copilot request handler, appending `extra_env`
     /// to the spawned runtime's environment (used to flip the WebSocket ExP
     /// flag for the WS transport tests).
@@ -626,6 +644,18 @@ fn client_options_for_cli(
         .with_cwd(cwd)
         .with_env(env)
         .with_use_logged_in_user(false);
+    // When the in-process FFI transport is the default (matrix cell that sets
+    // COPILOT_SDK_DEFAULT_CONNECTION=inprocess), pass the CLI entrypoint
+    // directly: the FFI host builds the `node <entrypoint> --embedded-host`
+    // argv itself and loads the sibling runtime cdylib. Splitting a `.js`
+    // entrypoint into node + prefix_args (the stdio layout) would point the
+    // library resolver at node's directory instead.
+    let inprocess_default = std::env::var("COPILOT_SDK_DEFAULT_CONNECTION")
+        .map(|value| value.eq_ignore_ascii_case("inprocess"))
+        .unwrap_or(false);
+    if inprocess_default {
+        return options.with_program(CliProgram::Path(cli_path.to_path_buf()));
+    }
     if cli_path
         .extension()
         .and_then(|extension| extension.to_str())

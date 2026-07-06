@@ -10,6 +10,8 @@ mod canvas_dispatch;
 #[cfg(feature = "bundled-cli")]
 pub(crate) mod embeddedcli;
 mod errors;
+/// In-process FFI transport hosting the runtime cdylib (`Transport::InProcess`).
+pub(crate) mod ffi;
 pub use errors::*;
 /// Connection-level Copilot request handler — intercept and replace the
 /// model-layer HTTP and WebSocket traffic the runtime issues for both CAPI and
@@ -112,6 +114,13 @@ pub enum Transport {
     /// Communicate over stdin/stdout pipes (default).
     #[default]
     Stdio,
+    /// Host the runtime in-process over FFI (no child process).
+    ///
+    /// Loads the runtime cdylib (`runtime.node`) next to the resolved CLI
+    /// entrypoint and speaks JSON-RPC over its C ABI. The runtime spawns its
+    /// own worker; the SDK never launches a CLI child process. This is the
+    /// Rust analogue of the .NET `RuntimeConnection.ForInProcess()`.
+    InProcess,
     /// Spawn the CLI with `--port` and connect via TCP.
     Tcp {
         /// Port to listen on (0 for OS-assigned).
@@ -850,6 +859,38 @@ fn generate_connection_token() -> String {
     hex
 }
 
+/// Environment variable that overrides the transport used when the caller
+/// leaves [`ClientOptions::transport`] at its default ([`Transport::Stdio`]).
+/// Accepts `"inprocess"` or `"stdio"` (case-insensitive); unset preserves
+/// stdio. Any other value is an error. Mirrors the .NET
+/// `COPILOT_SDK_DEFAULT_CONNECTION` handling.
+const DEFAULT_CONNECTION_ENV_VAR: &str = "COPILOT_SDK_DEFAULT_CONNECTION";
+
+/// Resolve a transport override from [`DEFAULT_CONNECTION_ENV_VAR`], checking
+/// [`ClientOptions::env`] first, then the process environment. Returns
+/// `Ok(None)` when the override is absent or selects stdio.
+fn resolve_default_transport(options: &ClientOptions) -> Result<Option<Transport>> {
+    let value = options
+        .env
+        .iter()
+        .find(|(key, _)| key.as_os_str() == std::ffi::OsStr::new(DEFAULT_CONNECTION_ENV_VAR))
+        .map(|(_, value)| value.to_string_lossy().into_owned())
+        .or_else(|| std::env::var(DEFAULT_CONNECTION_ENV_VAR).ok());
+
+    match value.as_deref() {
+        None => Ok(None),
+        Some(v) if v.is_empty() || v.eq_ignore_ascii_case("stdio") => Ok(None),
+        Some(v) if v.eq_ignore_ascii_case("inprocess") => Ok(Some(Transport::InProcess)),
+        Some(v) => Err(Error::with_message(
+            ErrorKind::InvalidConfig,
+            format!(
+                "invalid {DEFAULT_CONNECTION_ENV_VAR} value '{v}'. \
+                 Expected 'inprocess', 'stdio', or unset."
+            ),
+        )),
+    }
+}
+
 /// Connection to a GitHub Copilot CLI server (stdio, TCP, or external).
 ///
 /// Cheaply cloneable — cloning shares the underlying connection.
@@ -870,6 +911,9 @@ impl std::fmt::Debug for Client {
 
 struct ClientInner {
     child: parking_lot::Mutex<Option<Child>>,
+    /// In-process FFI runtime host, set only for [`Transport::InProcess`].
+    /// Closing it tears down the FFI connection and unloads the cdylib.
+    ffi_host: parking_lot::Mutex<Option<Arc<crate::ffi::FfiShared>>>,
     rpc: JsonRpcClient,
     cwd: PathBuf,
     request_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<JsonRpcRequest>>>,
@@ -929,6 +973,16 @@ impl Client {
         if let Some(cfg) = &options.session_fs {
             validate_session_fs_config(cfg)?;
         }
+        let mut options = options;
+        // Honor COPILOT_SDK_DEFAULT_CONNECTION when the caller leaves the
+        // transport at its default (stdio). Mirrors the .NET
+        // `ResolveDefaultConnection`: `inprocess` selects in-process FFI
+        // hosting, `stdio`/unset keeps stdio, anything else is an error.
+        if matches!(options.transport, Transport::Stdio)
+            && let Some(resolved) = resolve_default_transport(&options)?
+        {
+            options.transport = resolved;
+        }
         // Auth options only make sense when the SDK spawns the CLI; with an
         // external server, the server manages its own auth.
         if matches!(options.transport, Transport::External { .. }) {
@@ -970,9 +1024,8 @@ impl Client {
         // to the server. For Tcp, the SDK auto-generates one when the
         // caller leaves it unset so the loopback listener is safe by
         // default.
-        let mut options = options;
         let effective_connection_token: Option<String> = match &mut options.transport {
-            Transport::Stdio => None,
+            Transport::Stdio | Transport::InProcess => None,
             Transport::Tcp {
                 connection_token, ..
             } => Some(
@@ -1094,8 +1147,28 @@ impl Client {
                     options.mode,
                 )?
             }
+            Transport::InProcess => {
+                let environment = Self::build_ffi_environment(&options);
+                info!(entrypoint = %program.display(), "hosting copilot runtime in-process (FFI)");
+                let host = crate::ffi::FfiHost::create(&program, environment)?;
+                let (reader, writer, shared) = host.start().await?;
+                let client = Self::from_transport(
+                    reader,
+                    writer,
+                    None,
+                    options.working_directory,
+                    options.on_list_models,
+                    session_fs_config.is_some(),
+                    session_fs_sqlite_declared,
+                    options.on_get_trace_context,
+                    options.on_github_telemetry,
+                    effective_connection_token.clone(),
+                    options.mode,
+                )?;
+                *client.inner.ffi_host.lock() = Some(shared);
+                client
+            }
         };
-
         debug!(
             elapsed_ms = start_time.elapsed().as_millis(),
             "Client::start transport setup complete"
@@ -1294,6 +1367,7 @@ impl Client {
         let client = Self {
             inner: Arc::new(ClientInner {
                 child: parking_lot::Mutex::new(child),
+                ffi_host: parking_lot::Mutex::new(None),
                 rpc,
                 cwd,
                 request_rx: parking_lot::Mutex::new(Some(request_rx)),
@@ -1360,6 +1434,66 @@ impl Client {
                 }
             }
         });
+    }
+
+    fn build_ffi_environment(options: &ClientOptions) -> Vec<(String, String)> {
+        let mut env: std::collections::BTreeMap<String, String> = std::env::vars_os()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let mut set = |key: &str, value: String| {
+            env.insert(key.to_string(), value);
+        };
+        if let Some(token) = &options.github_token {
+            set("COPILOT_SDK_AUTH_TOKEN", token.clone());
+        }
+        if let Some(telemetry) = &options.telemetry {
+            set("COPILOT_OTEL_ENABLED", "true".to_string());
+            if let Some(endpoint) = &telemetry.otlp_endpoint {
+                set("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.clone());
+            }
+            if let Some(protocol) = telemetry.otlp_protocol {
+                set("OTEL_EXPORTER_OTLP_PROTOCOL", protocol.as_str().to_string());
+            }
+            if let Some(path) = &telemetry.file_path {
+                set(
+                    "COPILOT_OTEL_FILE_EXPORTER_PATH",
+                    path.to_string_lossy().into_owned(),
+                );
+            }
+            if let Some(exporter) = telemetry.exporter_type {
+                set("COPILOT_OTEL_EXPORTER_TYPE", exporter.as_str().to_string());
+            }
+            if let Some(source) = &telemetry.source_name {
+                set("COPILOT_OTEL_SOURCE_NAME", source.clone());
+            }
+            if let Some(capture) = telemetry.capture_content {
+                set(
+                    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+                    if capture { "true" } else { "false" }.to_string(),
+                );
+            }
+        }
+        if let Some(dir) = &options.base_directory {
+            set("COPILOT_HOME", dir.to_string_lossy().into_owned());
+        }
+        if options.mode == ClientMode::Empty {
+            set("COPILOT_DISABLE_KEYTAR", "1".to_string());
+        }
+        for (key, value) in &options.env {
+            env.insert(
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            );
+        }
+        for key in &options.env_remove {
+            env.remove(&*key.to_string_lossy());
+        }
+        env.into_iter().collect()
     }
 
     fn build_command(program: &Path, options: &ClientOptions) -> Command {
@@ -2063,7 +2197,8 @@ impl Client {
             self.inner.router.unregister(&session_id);
         }
 
-        let should_shutdown_runtime = self.inner.child.lock().is_some();
+        let should_shutdown_runtime =
+            self.inner.child.lock().is_some() || self.inner.ffi_host.lock().is_some();
         if should_shutdown_runtime {
             let runtime_shutdown_start = Instant::now();
             match tokio::time::timeout(RUNTIME_SHUTDOWN_TIMEOUT, self.rpc().runtime().shutdown())
@@ -2120,6 +2255,13 @@ impl Client {
             }
         }
 
+        // In-process FFI host: close the connection, shut the host down, and
+        // unload the cdylib. The runtime.shutdown RPC above already asked the
+        // worker to clean up; closing here tears down the transport.
+        if let Some(host) = self.inner.ffi_host.lock().take() {
+            host.close();
+        }
+
         info!(pid = ?pid, errors = errors.len(), "CLI process stopped");
         if errors.is_empty() {
             Ok(())
@@ -2164,6 +2306,9 @@ impl Client {
             && let Err(e) = child.start_kill()
         {
             error!(pid = ?pid, error = %e, "failed to send kill signal");
+        }
+        if let Some(host) = self.inner.ffi_host.lock().take() {
+            host.close();
         }
         self.inner.rpc.force_close();
         // Drop all session channels so any awaiters see a closed channel
@@ -2221,6 +2366,9 @@ impl Drop for ClientInner {
             } else {
                 info!(pid = ?pid, "kill signal sent for CLI process on drop");
             }
+        }
+        if let Some(host) = self.ffi_host.lock().take() {
+            host.close();
         }
     }
 }
@@ -2798,6 +2946,7 @@ mod tests {
         Client {
             inner: Arc::new(ClientInner {
                 child: parking_lot::Mutex::new(None),
+                ffi_host: parking_lot::Mutex::new(None),
                 rpc: {
                     let (req_tx, _req_rx) = mpsc::unbounded_channel();
                     let (notif_tx, _notif_rx) = broadcast::channel(16);
