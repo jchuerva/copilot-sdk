@@ -97,8 +97,8 @@ function buildArgvJson(cliEntrypoint: string): Buffer {
     // A `.js` entrypoint is launched via node; the packaged single-file CLI binary
     // embeds its own Node and is invoked directly.
     const argv = cliEntrypoint.toLowerCase().endsWith(".js")
-        ? ["node", cliEntrypoint, "--embedded-host", "--log-level", "all"]
-        : [cliEntrypoint, "--embedded-host", "--log-level", "all"];
+        ? ["node", cliEntrypoint, "--embedded-host"]
+        : [cliEntrypoint, "--embedded-host"];
     return Buffer.from(JSON.stringify(argv), "utf8");
 }
 
