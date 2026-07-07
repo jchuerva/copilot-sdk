@@ -128,8 +128,8 @@ jobs:
           RUNNER=""
           if [ "$RUNNER_OS" = "Linux" ] && [ "$COPILOT_SDK_DEFAULT_CONNECTION" = "inprocess" ]; then
             nproc || true
-            RUNNER="taskset -c 0"
-            echo "Pinning to 1 CPU via: $RUNNER"
+            RUNNER="taskset -c 0,1"
+            echo "Pinning to 2 CPUs via: $RUNNER"
           fi
           if [ -n "$TEST_NAME_FILTER" ]; then
             $RUNNER npx vitest run "$TEST_TARGET" -t "$TEST_NAME_FILTER"
