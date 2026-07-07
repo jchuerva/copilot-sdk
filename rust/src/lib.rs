@@ -120,6 +120,15 @@ pub enum Transport {
     /// entrypoint and speaks JSON-RPC over its C ABI. The runtime spawns its
     /// own worker; the SDK never launches a CLI child process. This is the
     /// Rust analogue of the .NET `RuntimeConnection.ForInProcess()`.
+    ///
+    /// **Experimental.** Per-client options that lower to environment variables
+    /// — [`ClientOptions::env`]/[`ClientOptions::env_remove`],
+    /// [`ClientOptions::telemetry`], [`ClientOptions::github_token`], and
+    /// [`ClientOptions::base_directory`] — are **not** honored with this
+    /// transport: the runtime loads into the shared host process and its worker
+    /// inherits that process's ambient environment. Configure the runtime via
+    /// the host process environment instead. See
+    /// <https://github.com/github/copilot-sdk/issues/1934>.
     InProcess,
     /// Spawn the CLI with `--port` and connect via TCP.
     Tcp {
@@ -1148,9 +1157,15 @@ impl Client {
                 )?
             }
             Transport::InProcess => {
-                let environment = Self::build_ffi_environment(&options);
+                // Per-client options that lower to environment variables (env,
+                // telemetry, github_token, base_directory) are not honored over the
+                // in-process transport: the runtime loads into this shared host
+                // process and its worker inherits this process's ambient environment,
+                // which a single env block cannot vary per client. Pass no per-client
+                // env; configure the runtime via the host process environment instead.
+                // See https://github.com/github/copilot-sdk/issues/1934.
                 info!(entrypoint = %program.display(), "hosting copilot runtime in-process (FFI)");
-                let host = crate::ffi::FfiHost::create(&program, environment)?;
+                let host = crate::ffi::FfiHost::create(&program, Vec::new())?;
                 let (reader, writer, shared) = host.start().await?;
                 let client = Self::from_transport(
                     reader,
@@ -1434,66 +1449,6 @@ impl Client {
                 }
             }
         });
-    }
-
-    fn build_ffi_environment(options: &ClientOptions) -> Vec<(String, String)> {
-        let mut env: std::collections::BTreeMap<String, String> = std::env::vars_os()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
-        let mut set = |key: &str, value: String| {
-            env.insert(key.to_string(), value);
-        };
-        if let Some(token) = &options.github_token {
-            set("COPILOT_SDK_AUTH_TOKEN", token.clone());
-        }
-        if let Some(telemetry) = &options.telemetry {
-            set("COPILOT_OTEL_ENABLED", "true".to_string());
-            if let Some(endpoint) = &telemetry.otlp_endpoint {
-                set("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.clone());
-            }
-            if let Some(protocol) = telemetry.otlp_protocol {
-                set("OTEL_EXPORTER_OTLP_PROTOCOL", protocol.as_str().to_string());
-            }
-            if let Some(path) = &telemetry.file_path {
-                set(
-                    "COPILOT_OTEL_FILE_EXPORTER_PATH",
-                    path.to_string_lossy().into_owned(),
-                );
-            }
-            if let Some(exporter) = telemetry.exporter_type {
-                set("COPILOT_OTEL_EXPORTER_TYPE", exporter.as_str().to_string());
-            }
-            if let Some(source) = &telemetry.source_name {
-                set("COPILOT_OTEL_SOURCE_NAME", source.clone());
-            }
-            if let Some(capture) = telemetry.capture_content {
-                set(
-                    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
-                    if capture { "true" } else { "false" }.to_string(),
-                );
-            }
-        }
-        if let Some(dir) = &options.base_directory {
-            set("COPILOT_HOME", dir.to_string_lossy().into_owned());
-        }
-        if options.mode == ClientMode::Empty {
-            set("COPILOT_DISABLE_KEYTAR", "1".to_string());
-        }
-        for (key, value) in &options.env {
-            env.insert(
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            );
-        }
-        for key in &options.env_remove {
-            env.remove(&*key.to_string_lossy());
-        }
-        env.into_iter().collect()
     }
 
     fn build_command(program: &Path, options: &ClientOptions) -> Command {
