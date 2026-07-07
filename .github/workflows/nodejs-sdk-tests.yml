@@ -65,7 +65,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest-xlarge, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         transport: ["default", "inprocess"]
     runs-on: ${{ matrix.os }}
     defaults:
@@ -121,8 +121,18 @@ jobs:
         env:
           COPILOT_HMAC_KEY: ${{ secrets.COPILOT_DEVELOPER_CLI_INTEGRATION_HMAC_KEY }}
         run: |
+          # TEMP experiment: on Linux inprocess, pin the whole process tree to a single
+          # CPU via taskset so tokio's default worker count (available_parallelism, which
+          # respects CPU affinity on Linux) is 1. If Linux then reproduces the mac/win
+          # in-process wedge, the trigger is tokio worker-thread count, not OS/arch.
+          RUNNER=""
+          if [ "$RUNNER_OS" = "Linux" ] && [ "$COPILOT_SDK_DEFAULT_CONNECTION" = "inprocess" ]; then
+            nproc || true
+            RUNNER="taskset -c 0"
+            echo "Pinning to 1 CPU via: $RUNNER"
+          fi
           if [ -n "$TEST_NAME_FILTER" ]; then
-            npx vitest run "$TEST_TARGET" -t "$TEST_NAME_FILTER"
+            $RUNNER npx vitest run "$TEST_TARGET" -t "$TEST_NAME_FILTER"
           else
-            npx vitest run $TEST_TARGET
+            $RUNNER npx vitest run $TEST_TARGET
           fi
