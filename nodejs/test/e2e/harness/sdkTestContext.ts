@@ -16,6 +16,16 @@ import { formatError, retry } from "./sdkTestHelper";
 export const isCI = process.env.GITHUB_ACTIONS === "true";
 export const DEFAULT_GITHUB_TOKEN = "fake-token-for-e2e-tests";
 
+/**
+ * True when the E2E suite is running over the in-process (FFI) transport
+ * (COPILOT_SDK_DEFAULT_CONNECTION=inprocess). Use with `it.skipIf` / `describe.skipIf`
+ * to skip tests for features that are not supported over the in-process transport (the
+ * runtime loads into the shared host process), so the in-process CI cell stays green.
+ * Such features are covered by the default (stdio) cell.
+ */
+export const isInProcessTransport =
+    (process.env.COPILOT_SDK_DEFAULT_CONNECTION ?? "").toLowerCase() === "inprocess";
+
 // The in-process (FFI) transport resolves auth host-side, in this test process, and
 // ranks HMAC above the GitHub token — so an ambient COPILOT_HMAC_KEY (CI sets one as a
 // job-level credential) would be picked over the SDK/Bearer token the replay snapshots
