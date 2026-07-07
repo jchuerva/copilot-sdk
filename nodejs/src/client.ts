@@ -109,6 +109,13 @@ function eventTrace(channel: string, sessionId: string, type: unknown, dispositi
     }
 }
 
+let rpcTraceSeq = 0;
+function rpcTrace(msg: string): void {
+    if (EVENT_TRACE) {
+        process.stderr.write(`[rpc ${Date.now() % 100000} pid=${process.pid}] ${msg}\n`);
+    }
+}
+
 /**
  * Check if value is a Zod schema (has toJSONSchema method)
  */
@@ -2671,6 +2678,32 @@ export class CopilotClient {
     private attachConnectionHandlers(): void {
         if (!this.connection) {
             return;
+        }
+
+        if (EVENT_TRACE) {
+            const conn = this.connection;
+            const original = conn.sendRequest.bind(conn);
+            (conn as { sendRequest: unknown }).sendRequest = (method: unknown, ...args: unknown[]) => {
+                const seq = ++rpcTraceSeq;
+                rpcTrace(`>>REQ seq=${seq} method=${String(method)}`);
+                let result: Promise<unknown>;
+                try {
+                    result = original(method as never, ...(args as never[]));
+                } catch (err) {
+                    rpcTrace(`!!REQ seq=${seq} method=${String(method)} threw=${String(err)}`);
+                    throw err;
+                }
+                return Promise.resolve(result).then(
+                    (value) => {
+                        rpcTrace(`<<RES seq=${seq} method=${String(method)} ok`);
+                        return value;
+                    },
+                    (err) => {
+                        rpcTrace(`<<RES seq=${seq} method=${String(method)} err=${String(err)}`);
+                        throw err;
+                    }
+                );
+            };
         }
 
         this.connection.onNotification("session.event", (notification: unknown) => {

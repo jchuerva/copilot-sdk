@@ -108,11 +108,17 @@ jobs:
         run: |
           echo "COPILOT_SDK_DEFAULT_CONNECTION=inprocess" >> "$GITHUB_ENV"
           echo "COPILOT_EVENT_TRACE=1" >> "$GITHUB_ENV"
-          # TEMP experiment: run ONLY permissions in isolation over in-process to test
-          # whether the mac failures reproduce without any other test file in the fork.
+          # TEMP experiment: run ONE pure-RPC failing test in isolation over in-process
+          # to test whether a single test reproduces the mac hang with no prior tests.
           echo "TEST_TARGET=test/e2e/permissions.e2e.test.ts" >> "$GITHUB_ENV"
+          echo 'TEST_NAME_FILTER=should configure and update permission paths' >> "$GITHUB_ENV"
 
       - name: Run Node.js SDK tests
         env:
           COPILOT_HMAC_KEY: ${{ secrets.COPILOT_DEVELOPER_CLI_INTEGRATION_HMAC_KEY }}
-        run: npx vitest run $TEST_TARGET
+        run: |
+          if [ -n "$TEST_NAME_FILTER" ]; then
+            npx vitest run "$TEST_TARGET" -t "$TEST_NAME_FILTER"
+          else
+            npx vitest run $TEST_TARGET
+          fi
