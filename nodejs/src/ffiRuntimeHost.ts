@@ -166,13 +166,18 @@ export class FfiRuntimeHost {
         this.lib = loadLibrary(libraryPath);
         this.receiveStream = new PassThrough();
         this.sendStream = new Writable({
+            // Write frames via an ASYNCHRONOUS FFI call so the JS event loop is never
+            // blocked inside native code. The runtime can deliver an inbound frame (the
+            // response, or a server→client request) on a secondary thread while this
+            // write is in flight; koffi queues that callback to run when the event loop
+            // gets a turn. A synchronous connection_write would block the single JS
+            // thread for the whole native call, so if the runtime delivered the response
+            // during the write and waited for it to be consumed, main and worker would
+            // deadlock — koffi warns about exactly this. Observed as hung
+            // `session.rpc.permissions.*` round-trips on macOS. Node's Writable serializes
+            // writes (the next write waits for this callback), so frame order is preserved.
             write: (chunk: Buffer, _encoding, callback) => {
-                try {
-                    this.writeFrame(chunk);
-                    callback();
-                } catch (error) {
-                    callback(error as Error);
-                }
+                this.writeFrame(chunk, callback);
             },
         });
     }
@@ -271,13 +276,41 @@ export class FfiRuntimeHost {
         this.keepAlive = setInterval(() => {}, FfiRuntimeHost.INBOUND_PUMP_INTERVAL_MS);
     }
 
-    private writeFrame(frame: Buffer): void {
+    private writeFrame(frame: Buffer, callback: (error?: Error | null) => void): void {
         if (this.disposed || !this.connectionId) {
-            throw new Error("The in-process runtime connection is closed.");
+            callback(new Error("The in-process runtime connection is closed."));
+            return;
         }
-        if (!this.lib.connectionWrite(this.connectionId, frame, frame.length)) {
-            throw new Error("Failed to write a frame to the in-process runtime connection.");
-        }
+        // Asynchronous FFI call: runs on a libuv worker thread and invokes this callback
+        // when the native write completes, keeping the JS event loop free to service
+        // inbound native→JS callbacks in the meantime (see the sendStream comment).
+        this.lib.connectionWrite.async(
+            this.connectionId,
+            frame,
+            frame.length,
+            (error: Error | null, result: boolean) => {
+                // Node-API completion callback: guard so a throw here (e.g. the stream's
+                // own callback rejecting after teardown) can't escape across the FFI
+                // boundary as an uncaught Node-API callback exception (DEP0168).
+                try {
+                    if (error) {
+                        callback(error);
+                    } else if (!result) {
+                        callback(
+                            new Error(
+                                "Failed to write a frame to the in-process runtime connection."
+                            )
+                        );
+                    } else {
+                        callback();
+                    }
+                } catch (callbackError) {
+                    console.error(
+                        `In-process FFI write completion callback failed: ${callbackError instanceof Error ? (callbackError.stack ?? callbackError.message) : String(callbackError)}`
+                    );
+                }
+            }
+        );
     }
 
     /**
@@ -295,15 +328,29 @@ export class FfiRuntimeHost {
      * on macOS).
      */
     private feedInbound(bytesPtr: unknown, bytesLen: number | bigint): void {
-        const length = Number(bytesLen);
-        if (!bytesPtr || length <= 0) {
-            return;
-        }
-        const bytes = koffi.decode(bytesPtr, koffi.array("uint8", length, "Typed")) as Uint8Array;
-        this.inboundQueue.push(Buffer.from(bytes));
-        if (!this.drainScheduled) {
-            this.drainScheduled = true;
-            setImmediate(() => this.drainInbound());
+        // This runs as a native→JS (Node-API) callback, possibly from a secondary
+        // thread. An exception thrown here cannot propagate across the FFI boundary and
+        // is swallowed by the runtime (surfacing only as a DEP0168 "Uncaught Node-API
+        // callback exception" warning), so catch and log it here instead of letting it
+        // escape.
+        try {
+            const length = Number(bytesLen);
+            if (!bytesPtr || length <= 0) {
+                return;
+            }
+            const bytes = koffi.decode(
+                bytesPtr,
+                koffi.array("uint8", length, "Typed")
+            ) as Uint8Array;
+            this.inboundQueue.push(Buffer.from(bytes));
+            if (!this.drainScheduled) {
+                this.drainScheduled = true;
+                setImmediate(() => this.drainInbound());
+            }
+        } catch (error) {
+            console.error(
+                `In-process FFI inbound callback failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`
+            );
         }
     }
 
