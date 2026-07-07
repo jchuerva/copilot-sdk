@@ -2683,7 +2683,10 @@ export class CopilotClient {
         if (EVENT_TRACE) {
             const conn = this.connection;
             const original = conn.sendRequest.bind(conn);
-            (conn as { sendRequest: unknown }).sendRequest = (method: unknown, ...args: unknown[]) => {
+            (conn as { sendRequest: unknown }).sendRequest = (
+                method: unknown,
+                ...args: unknown[]
+            ) => {
                 const seq = ++rpcTraceSeq;
                 rpcTrace(`>>REQ seq=${seq} method=${String(method)}`);
                 let result: Promise<unknown>;

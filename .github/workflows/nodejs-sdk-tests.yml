@@ -108,10 +108,11 @@ jobs:
         run: |
           echo "COPILOT_SDK_DEFAULT_CONNECTION=inprocess" >> "$GITHUB_ENV"
           echo "COPILOT_EVENT_TRACE=1" >> "$GITHUB_ENV"
-          # TEMP experiment: run ONE pure-RPC failing test in isolation over in-process
-          # to test whether a single test reproduces the mac hang with no prior tests.
+          # TEMP experiment: run the FULL permissions file with event+RPC tracing over
+          # in-process to capture the exact RPC that first wedges (mac fails tests 13-16
+          # in-file, but each passes in isolation -> accumulated-state/ordering bug).
           echo "TEST_TARGET=test/e2e/permissions.e2e.test.ts" >> "$GITHUB_ENV"
-          echo 'TEST_NAME_FILTER=should configure and update permission paths' >> "$GITHUB_ENV"
+          echo 'TEST_NAME_FILTER=' >> "$GITHUB_ENV"
 
       - name: Run Node.js SDK tests
         env:
