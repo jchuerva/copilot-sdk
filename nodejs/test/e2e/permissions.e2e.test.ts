@@ -419,7 +419,10 @@ describe("Permission callbacks", async () => {
         const session = await client.createSession({
             onPermissionRequest: (_request: PermissionRequest): PermissionRequestResult => {
                 resolvePermissionCalled();
-                return { kind: "no-result" };
+                // EXPERIMENT: reply instead of no-result to test whether the orphaned
+                // (unanswered) permission request is what wedges the shared in-process
+                // worker for the subsequent tests.
+                return { kind: "approve-once" };
             },
         });
 
