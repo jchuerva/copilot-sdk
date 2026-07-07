@@ -663,6 +663,12 @@ export class CopilotSession {
                 sessionId: this.sessionId,
             });
             if (result.kind === "no-result") {
+                if (process.env.COPILOT_EVENT_TRACE === "1") {
+                    process.stderr.write(
+                        `[evt ${Date.now() % 100000} pid=${process.pid}] no-result-skip ` +
+                            `requestId=${requestId} sid=${this.sessionId}\n`
+                    );
+                }
                 return;
             }
             if (this.disconnected) {

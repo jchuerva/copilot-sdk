@@ -24,6 +24,9 @@ import { PassThrough, Writable } from "node:stream";
 
 const SYMBOL_PREFIX = "copilot_runtime_";
 
+/** Temporary, env-gated (COPILOT_FFI_TRACE=1) inbound-callback liveness tracing. */
+const FFI_TRACE = process.env.COPILOT_FFI_TRACE === "1";
+
 type KoffiFunction = ReturnType<ReturnType<typeof koffi.load>["func"]>;
 type KoffiType = ReturnType<typeof koffi.pointer>;
 type KoffiRegisteredCallback = ReturnType<typeof koffi.register>;
@@ -155,27 +158,15 @@ export class FfiRuntimeHost {
         this.lib = loadLibrary(libraryPath);
         this.receiveStream = new PassThrough();
         this.sendStream = new Writable({
-            // Write frames with an ASYNCHRONOUS FFI call. This is the crux of Node
-            // in-process parity with .NET. koffi delivers the runtime's outbound
-            // (worker->SDK) callback by marshalling it to the JS main thread and BLOCKING
-            // the cdylib's reader thread (napi_tsfn_blocking) until JS runs it — unlike
-            // .NET's raw fn-pointer callback, which runs inline on the reader thread with
-            // a non-blocking Channel.TryWrite and never blocks. If we also ran
-            // connection_write SYNCHRONOUSLY on the JS main thread, a burst of inbound
-            // frames could deadlock: the reader thread blocks in the callback for frame B
-            // (awaiting JS) while the JS main thread blocks in a synchronous
-            // connection_write triggered by dispatching frame A (awaiting the reader
-            // thread) — a bidirectional wedge observed as permanently stalled inbound
-            // delivery on macOS/Windows (e.g. a session.destroy issued with a permission
-            // round-trip still in flight). Issuing the write asynchronously (libuv
-            // threadpool) keeps the JS main thread free to service the inbound callback,
-            // so the reader thread never stays blocked. Node's Writable serializes writes
-            // (one in flight, next only after callback), so frame order is preserved.
+            // Write frames with a synchronous FFI call (restored while diagnosing the
+            // macOS/Windows inbound-callback stall; async writes were a no-op for it).
             write: (chunk: Buffer, _encoding, callback) => {
-                this.writeFrame(chunk).then(
-                    () => callback(),
-                    (error) => callback(error as Error)
-                );
+                try {
+                    this.writeFrame(chunk);
+                    callback();
+                } catch (error) {
+                    callback(error as Error);
+                }
             },
         });
     }
@@ -271,33 +262,25 @@ export class FfiRuntimeHost {
             throw new Error("copilot_runtime_connection_open failed.");
         }
 
-        this.keepAlive = setInterval(() => {}, FfiRuntimeHost.KEEPALIVE_INTERVAL_MS);
+        let ticks = 0;
+        this.keepAlive = setInterval(() => {
+            if (FFI_TRACE) {
+                ticks++;
+                process.stderr.write(
+                    `[ffi ${Date.now() % 100000} pid=${process.pid}] TICK ${ticks} inboundSeq=${this.inboundSeq} qlen=${this.inboundQueue.length}\n`
+                );
+            }
+        }, FfiRuntimeHost.KEEPALIVE_INTERVAL_MS);
     }
 
-    private writeFrame(frame: Buffer): Promise<void> {
+    private writeFrame(frame: Buffer): void {
         if (this.disposed || !this.connectionId) {
-            return Promise.reject(new Error("The in-process runtime connection is closed."));
+            throw new Error("The in-process runtime connection is closed.");
         }
-        return new Promise<void>((resolvePromise, rejectPromise) => {
-            this.lib.connectionWrite.async(
-                this.connectionId,
-                frame,
-                frame.length,
-                (error: Error | null, ok: boolean) => {
-                    if (error) {
-                        rejectPromise(error);
-                    } else if (!ok) {
-                        rejectPromise(
-                            new Error(
-                                "Failed to write a frame to the in-process runtime connection."
-                            )
-                        );
-                    } else {
-                        resolvePromise();
-                    }
-                }
-            );
-        });
+        const ok = this.lib.connectionWrite(this.connectionId, frame, frame.length);
+        if (!ok) {
+            throw new Error("Failed to write a frame to the in-process runtime connection.");
+        }
     }
 
     /**
@@ -314,12 +297,20 @@ export class FfiRuntimeHost {
      * still on the stack and deadlock (observed as hung `session.rpc.*` round-trips
      * on macOS).
      */
+    private inboundSeq = 0;
+
     private feedInbound(bytesPtr: unknown, bytesLen: number | bigint): void {
         // This runs as a native→JS (Node-API) callback, possibly from a secondary
         // thread. An exception thrown here cannot propagate across the FFI boundary and
         // is swallowed by the runtime (surfacing only as a DEP0168 "Uncaught Node-API
         // callback exception" warning), so catch and log it here instead of letting it
         // escape.
+        const seq = ++this.inboundSeq;
+        if (FFI_TRACE) {
+            process.stderr.write(
+                `[ffi ${Date.now() % 100000} pid=${process.pid}] CB-ENTER seq=${seq} len=${Number(bytesLen)}\n`
+            );
+        }
         try {
             const length = Number(bytesLen);
             if (!bytesPtr || length <= 0) {
@@ -338,6 +329,12 @@ export class FfiRuntimeHost {
             console.error(
                 `In-process FFI inbound callback failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`
             );
+        } finally {
+            if (FFI_TRACE) {
+                process.stderr.write(
+                    `[ffi ${Date.now() % 100000} pid=${process.pid}] CB-EXIT seq=${seq}\n`
+                );
+            }
         }
     }
 
@@ -350,6 +347,11 @@ export class FfiRuntimeHost {
         }
         let frame: Buffer | undefined;
         while ((frame = this.inboundQueue.shift()) !== undefined) {
+            if (FFI_TRACE) {
+                process.stderr.write(
+                    `[ffi ${Date.now() % 100000} pid=${process.pid}] DRAIN len=${frame.length}\n`
+                );
+            }
             this.receiveStream.write(frame);
         }
     }
