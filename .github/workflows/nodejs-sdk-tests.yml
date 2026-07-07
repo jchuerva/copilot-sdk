@@ -108,8 +108,11 @@ jobs:
         run: |
           echo "COPILOT_SDK_DEFAULT_CONNECTION=inprocess" >> "$GITHUB_ENV"
           echo "COPILOT_EVENT_TRACE=1" >> "$GITHUB_ENV"
+          # TEMP experiment: run ONLY permissions in isolation over in-process to test
+          # whether the mac failures reproduce without any other test file in the fork.
+          echo "TEST_TARGET=test/e2e/permissions.e2e.test.ts" >> "$GITHUB_ENV"
 
       - name: Run Node.js SDK tests
         env:
           COPILOT_HMAC_KEY: ${{ secrets.COPILOT_DEVELOPER_CLI_INTEGRATION_HMAC_KEY }}
-        run: npm test
+        run: npx vitest run $TEST_TARGET
