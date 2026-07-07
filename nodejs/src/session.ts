@@ -299,6 +299,12 @@ export class CopilotSession {
         // Register event handler BEFORE calling send to avoid race condition
         // where session.idle fires before we start listening
         const unsubscribe = this.on((event) => {
+            if (process.env.COPILOT_EVENT_TRACE === "1") {
+                process.stderr.write(
+                    `[evt ${Date.now() % 100000} pid=${process.pid}] sendAndWait-recv ` +
+                        `type=${event.type} sid=${this.sessionId}\n`
+                );
+            }
             if (event.type === "assistant.message") {
                 lastAssistantMessage = event;
             } else if (event.type === "session.idle") {

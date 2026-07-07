@@ -104,7 +104,7 @@ function eventTrace(channel: string, sessionId: string, type: unknown, dispositi
     if (EVENT_TRACE) {
         process.stderr.write(
             `[evt ${Date.now() % 100000} pid=${process.pid}] ${channel} type=${String(type)} ` +
-                `sid=${sessionId.slice(0, 8)} ${disposition}\n`
+                `sid=${sessionId} ${disposition}\n`
         );
     }
 }
