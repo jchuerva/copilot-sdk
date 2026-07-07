@@ -368,10 +368,31 @@ export class FfiRuntimeHost {
     }
 
     private unregisterCallback(): void {
-        if (this.outboundCallback !== undefined) {
-            koffi.unregister(this.outboundCallback);
-            this.outboundCallback = undefined;
+        if (this.outboundCallback === undefined) {
+            return;
         }
+        const callback = this.outboundCallback;
+        this.outboundCallback = undefined;
+        // Defer the unregister to a later tick instead of unregistering synchronously.
+        // koffi delivers outbound callbacks from a secondary thread by queuing them onto
+        // the JS event loop; at teardown one such delivery can still be queued after we
+        // stop the native side. Unregistering while koffi still has a queued call makes
+        // koffi invoke a torn-down callback and raise inside its own native code — an
+        // uncaught Node-API callback exception (DEP0168) that no JS try/catch can catch.
+        // The native connection/host are already closed by the time this runs (see
+        // dispose), so no new deliveries originate; a queued delivery fires in libuv's
+        // poll phase and setImmediate (check phase) runs right after it in the same loop
+        // iteration, so the pending delivery (a no-op, since we are disposed) drains
+        // before we free the slot.
+        const immediate = setImmediate(() => {
+            try {
+                koffi.unregister(callback);
+            } catch {
+                // Ignore teardown failures.
+            }
+        });
+        // Don't let this housekeeping timer keep the process alive.
+        immediate.unref?.();
     }
 
     /** Closes the FFI connection, shuts down the native host, and releases resources. */
