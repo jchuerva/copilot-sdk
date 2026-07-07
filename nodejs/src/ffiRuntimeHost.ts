@@ -24,6 +24,38 @@ import { PassThrough, Writable } from "node:stream";
 
 const SYMBOL_PREFIX = "copilot_runtime_";
 
+/**
+ * Temporary, env-gated tracing (COPILOT_FFI_TRACE=1) for diagnosing in-process FFI
+ * transport stalls. Logs frame writes/completions/inbound arrivals with a monotonic
+ * sequence and the JSON-RPC id/method, plus a periodic heartbeat, so we can tell
+ * whether a stalled round-trip is stuck on the write, on inbound delivery, or on the
+ * event loop parking. Writes to stderr to avoid interleaving with JSON-RPC stdout.
+ */
+const FFI_TRACE = process.env.COPILOT_FFI_TRACE === "1";
+function ffiTrace(message: string): void {
+    if (FFI_TRACE) {
+        process.stderr.write(`[ffi ${Date.now() % 100000} pid=${process.pid}] ${message}\n`);
+    }
+}
+
+/** Extracts a compact `id/method` tag from a JSON-RPC frame for trace correlation. */
+function frameTag(frame: Buffer): string {
+    if (!FFI_TRACE) {
+        return "";
+    }
+    try {
+        const text = frame.toString("utf8");
+        const bodyStart = text.indexOf("\r\n\r\n");
+        const body = bodyStart >= 0 ? text.slice(bodyStart + 4) : text;
+        const parsed = JSON.parse(body) as { id?: unknown; method?: unknown };
+        const id = parsed.id !== undefined ? `id=${JSON.stringify(parsed.id)}` : "";
+        const method = parsed.method !== undefined ? `m=${String(parsed.method)}` : "";
+        return [id, method].filter(Boolean).join(" ") || "(no id/method)";
+    } catch {
+        return `(unparsed ${frame.length}B)`;
+    }
+}
+
 type KoffiFunction = ReturnType<ReturnType<typeof koffi.load>["func"]>;
 type KoffiType = ReturnType<typeof koffi.pointer>;
 type KoffiRegisteredCallback = ReturnType<typeof koffi.register>;
@@ -273,14 +305,23 @@ export class FfiRuntimeHost {
             throw new Error("copilot_runtime_connection_open failed.");
         }
 
-        this.keepAlive = setInterval(() => {}, FfiRuntimeHost.INBOUND_PUMP_INTERVAL_MS);
+        let heartbeat = 0;
+        this.keepAlive = setInterval(() => {
+            if (FFI_TRACE && ++heartbeat % 250 === 0) {
+                ffiTrace(`~tick ${heartbeat} pending=${this.inboundQueue.length}`);
+            }
+        }, FfiRuntimeHost.INBOUND_PUMP_INTERVAL_MS);
     }
+
+    private writeSeq = 0;
 
     private writeFrame(frame: Buffer, callback: (error?: Error | null) => void): void {
         if (this.disposed || !this.connectionId) {
             callback(new Error("The in-process runtime connection is closed."));
             return;
         }
+        const seq = ++this.writeSeq;
+        ffiTrace(`>>W seq=${seq} len=${frame.length} ${frameTag(frame)}`);
         // Asynchronous FFI call: runs on a libuv worker thread and invokes this callback
         // when the native write completes, keeping the JS event loop free to service
         // inbound native→JS callbacks in the meantime (see the sendStream comment).
@@ -289,6 +330,7 @@ export class FfiRuntimeHost {
             frame,
             frame.length,
             (error: Error | null, result: boolean) => {
+                ffiTrace(`>>WDONE seq=${seq} ok=${!error && result} err=${error?.message ?? "-"}`);
                 // Node-API completion callback: guard so a throw here (e.g. the stream's
                 // own callback rejecting after teardown) can't escape across the FFI
                 // boundary as an uncaught Node-API callback exception (DEP0168).
@@ -342,7 +384,9 @@ export class FfiRuntimeHost {
                 bytesPtr,
                 koffi.array("uint8", length, "Typed")
             ) as Uint8Array;
-            this.inboundQueue.push(Buffer.from(bytes));
+            const frame = Buffer.from(bytes);
+            ffiTrace(`<<R len=${length} ${frameTag(frame)}`);
+            this.inboundQueue.push(frame);
             if (!this.drainScheduled) {
                 this.drainScheduled = true;
                 setImmediate(() => this.drainInbound());
@@ -363,6 +407,7 @@ export class FfiRuntimeHost {
         }
         let frame: Buffer | undefined;
         while ((frame = this.inboundQueue.shift()) !== undefined) {
+            ffiTrace(`<<DELIVER len=${frame.length} ${frameTag(frame)}`);
             this.receiveStream.write(frame);
         }
     }
