@@ -94,6 +94,22 @@ const MIN_PROTOCOL_VERSION = 3;
 const RUNTIME_SHUTDOWN_TIMEOUT_MS = 10_000;
 
 /**
+ * Temporary, env-gated event tracing (COPILOT_EVENT_TRACE=1) for diagnosing in-process
+ * session stalls (e.g. `sendAndWait` never seeing `session.idle`). Logs each inbound
+ * `session.event` / `session.lifecycle` notification's type as it is dispatched, to
+ * stderr. Remove once the in-process event-delivery gap is resolved.
+ */
+const EVENT_TRACE = process.env.COPILOT_EVENT_TRACE === "1";
+function eventTrace(channel: string, sessionId: string, type: unknown, disposition: string): void {
+    if (EVENT_TRACE) {
+        process.stderr.write(
+            `[evt ${Date.now() % 100000} pid=${process.pid}] ${channel} type=${String(type)} ` +
+                `sid=${sessionId.slice(0, 8)} ${disposition}\n`
+        );
+    }
+}
+
+/**
  * Check if value is a Zod schema (has toJSONSchema method)
  */
 function isZodSchema(value: unknown): value is { toJSONSchema(): Record<string, unknown> } {
@@ -2743,8 +2759,15 @@ export class CopilotClient {
         }
 
         const session = this.sessions.get((notification as { sessionId: string }).sessionId);
+        const event = (notification as { event: SessionEvent }).event;
+        eventTrace(
+            "session.event",
+            (notification as { sessionId: string }).sessionId,
+            (event as { type?: unknown })?.type,
+            session ? "dispatch" : "no-session"
+        );
         if (session) {
-            session._dispatchEvent((notification as { event: SessionEvent }).event);
+            session._dispatchEvent(event);
         }
     }
 
@@ -2780,6 +2803,8 @@ export class CopilotClient {
             sessionId: raw.sessionId,
             metadata,
         } as SessionLifecycleEvent;
+
+        eventTrace("session.lifecycle", raw.sessionId, raw.type, "dispatch");
 
         // Dispatch to typed handlers for this specific event type
         const typedHandlers = this.typedLifecycleHandlers.get(event.type);

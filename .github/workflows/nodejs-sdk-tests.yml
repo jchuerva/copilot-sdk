@@ -107,7 +107,7 @@ jobs:
         if: matrix.transport == 'inprocess'
         run: |
           echo "COPILOT_SDK_DEFAULT_CONNECTION=inprocess" >> "$GITHUB_ENV"
-          echo "COPILOT_FFI_TRACE=1" >> "$GITHUB_ENV"
+          echo "COPILOT_EVENT_TRACE=1" >> "$GITHUB_ENV"
 
       - name: Run Node.js SDK tests
         env:

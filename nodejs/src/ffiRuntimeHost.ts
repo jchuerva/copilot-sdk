@@ -24,38 +24,6 @@ import { PassThrough, Writable } from "node:stream";
 
 const SYMBOL_PREFIX = "copilot_runtime_";
 
-/**
- * Temporary, env-gated tracing (COPILOT_FFI_TRACE=1) for diagnosing in-process FFI
- * transport stalls. Logs frame writes/completions/inbound arrivals with a monotonic
- * sequence and the JSON-RPC id/method, plus a periodic heartbeat, so we can tell
- * whether a stalled round-trip is stuck on the write, on inbound delivery, or on the
- * event loop parking. Writes to stderr to avoid interleaving with JSON-RPC stdout.
- */
-const FFI_TRACE = process.env.COPILOT_FFI_TRACE === "1";
-function ffiTrace(message: string): void {
-    if (FFI_TRACE) {
-        process.stderr.write(`[ffi ${Date.now() % 100000} pid=${process.pid}] ${message}\n`);
-    }
-}
-
-/** Extracts a compact `id/method` tag from a JSON-RPC frame for trace correlation. */
-function frameTag(frame: Buffer): string {
-    if (!FFI_TRACE) {
-        return "";
-    }
-    try {
-        const text = frame.toString("utf8");
-        const bodyStart = text.indexOf("\r\n\r\n");
-        const body = bodyStart >= 0 ? text.slice(bodyStart + 4) : text;
-        const parsed = JSON.parse(body) as { id?: unknown; method?: unknown };
-        const id = parsed.id !== undefined ? `id=${JSON.stringify(parsed.id)}` : "";
-        const method = parsed.method !== undefined ? `m=${String(parsed.method)}` : "";
-        return [id, method].filter(Boolean).join(" ") || "(no id/method)";
-    } catch {
-        return `(unparsed ${frame.length}B)`;
-    }
-}
-
 type KoffiFunction = ReturnType<ReturnType<typeof koffi.load>["func"]>;
 type KoffiType = ReturnType<typeof koffi.pointer>;
 type KoffiRegisteredCallback = ReturnType<typeof koffi.register>;
@@ -66,7 +34,6 @@ interface FfiLibrary {
     connectionOpen: KoffiFunction;
     connectionWrite: KoffiFunction;
     connectionClose: KoffiFunction;
-    logDroppedCount: KoffiFunction;
     outboundCallbackType: KoffiType;
 }
 
@@ -120,10 +87,6 @@ function loadLibrary(libraryPath: string): FfiLibrary {
             "size_t",
         ]),
         connectionClose: lib.func(`${SYMBOL_PREFIX}connection_close`, "bool", ["uint32"]),
-        // A no-argument, side-effect-free diagnostic getter (returns a dropped-log
-        // counter). Used purely as a cheap async FFI call to keep koffi's asynchronous
-        // callback broker pumping while the connection is idle (see the pump in start()).
-        logDroppedCount: lib.func(`${SYMBOL_PREFIX}log_dropped_count`, "uint64", []),
         outboundCallbackType,
     };
     loadedLibraryPath = libraryPath;
@@ -162,25 +125,14 @@ export class FfiRuntimeHost {
     private disposed = false;
     private outboundCallback: KoffiRegisteredCallback | undefined;
     /**
-     * Keeps koffi's asynchronous callback broker pumping while the connection is open,
-     * so inbound native→JS frames are delivered promptly even when the SDK is otherwise
-     * idle (waiting on a bare request/response).
-     *
-     * The runtime invokes our outbound callback from a secondary thread. koffi marshals
-     * such foreign-thread callbacks to the JS main thread, but only services that queue
-     * while a koffi asynchronous FFI call is in flight — during streaming, the constant
-     * `connectionWrite.async` traffic keeps it pumped, but once the SDK goes idle after
-     * a single request a plain timer keeps the event loop alive WITHOUT pumping koffi's
-     * broker, so the response frame sits undelivered until the next koffi async call
-     * (observed as 30s-timeout hangs of bare `session.rpc.*` round-trips, most visibly on
-     * macOS/Windows). Issuing a cheap async FFI call on a short interval keeps the broker
-     * serviced. This is the koffi analogue of the .NET host's raw function-pointer
-     * callback, which needs no event-loop pumping because it runs directly on the runtime
-     * thread into a thread-safe `Channel`.
+     * Keeps the libuv event loop alive while the FFI connection is open. Unlike the
+     * stdio/TCP transports (whose pipe/socket handles keep the loop alive), the FFI
+     * transport has no libuv handle of its own; without a live handle the loop could
+     * park with no work while awaiting inbound native→JS frames.
      */
     private keepAlive: ReturnType<typeof setInterval> | null = null;
-    /** Interval (ms) between async broker pumps; short so idle round-trips stay prompt. */
-    private static readonly INBOUND_PUMP_INTERVAL_MS = 4;
+    /** Interval (ms) for the keep-alive timer. */
+    private static readonly KEEPALIVE_INTERVAL_MS = 1000;
     /**
      * Inbound frame bytes copied out of the native callback, awaiting delivery to
      * {@link receiveStream} on a clean event-loop tick. See {@link feedInbound}.
@@ -311,24 +263,14 @@ export class FfiRuntimeHost {
             throw new Error("copilot_runtime_connection_open failed.");
         }
 
-        let heartbeat = 0;
-        this.keepAlive = setInterval(() => {
-            if (FFI_TRACE && ++heartbeat % 250 === 0) {
-                ffiTrace(`~tick ${heartbeat} pending=${this.inboundQueue.length}`);
-            }
-        }, FfiRuntimeHost.INBOUND_PUMP_INTERVAL_MS);
+        this.keepAlive = setInterval(() => {}, FfiRuntimeHost.KEEPALIVE_INTERVAL_MS);
     }
-
-    private writeSeq = 0;
 
     private writeFrame(frame: Buffer): void {
         if (this.disposed || !this.connectionId) {
             throw new Error("The in-process runtime connection is closed.");
         }
-        const seq = ++this.writeSeq;
-        ffiTrace(`>>W seq=${seq} len=${frame.length} ${frameTag(frame)}`);
         const ok = this.lib.connectionWrite(this.connectionId, frame, frame.length);
-        ffiTrace(`>>WDONE seq=${seq} ok=${ok}`);
         if (!ok) {
             throw new Error("Failed to write a frame to the in-process runtime connection.");
         }
@@ -363,9 +305,7 @@ export class FfiRuntimeHost {
                 bytesPtr,
                 koffi.array("uint8", length, "Typed")
             ) as Uint8Array;
-            const frame = Buffer.from(bytes);
-            ffiTrace(`<<R len=${length} ${frameTag(frame)}`);
-            this.inboundQueue.push(frame);
+            this.inboundQueue.push(Buffer.from(bytes));
             if (!this.drainScheduled) {
                 this.drainScheduled = true;
                 setImmediate(() => this.drainInbound());
@@ -386,7 +326,6 @@ export class FfiRuntimeHost {
         }
         let frame: Buffer | undefined;
         while ((frame = this.inboundQueue.shift()) !== undefined) {
-            ffiTrace(`<<DELIVER len=${frame.length} ${frameTag(frame)}`);
             this.receiveStream.write(frame);
         }
     }
