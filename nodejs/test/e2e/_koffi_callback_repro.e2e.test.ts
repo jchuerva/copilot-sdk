@@ -50,6 +50,42 @@ void start_pinger(ping_cb cb, int delay_ms, int count) {
     pthread_create(&t, 0, pinger, 0);
     pthread_detach(t);
 }
+
+// A side-effect-free call used to mimic the SDK's async FFI traffic (writes/pump)
+// happening concurrently with background-thread callbacks.
+int noop(void) { return 0; }
+
+typedef void (*blob_cb)(int seq, const unsigned char *data, int len);
+
+static blob_cb g_blob_cb;
+static int g_burst;
+static int g_big_at;
+static int g_big_len;
+
+static void *burster(void *arg) {
+    (void)arg;
+    // Small settle so the JS main loop is idle/parked before the burst starts.
+    usleep(200 * 1000);
+    static unsigned char buf[65536];
+    for (int i = 0; i < g_burst; i++) {
+        int len = (i == g_big_at) ? g_big_len : 64;
+        for (int j = 0; j < len; j++) buf[j] = (unsigned char)(i + j);
+        if (g_blob_cb) g_blob_cb(i, buf, len);
+    }
+    return 0;
+}
+
+// Blast 'burst' callbacks back-to-back (no delay), one of them 'big_len' bytes,
+// mirroring a streaming turn's rapid inbound frames including a large payload.
+void start_burster(blob_cb cb, int burst, int big_at, int big_len) {
+    g_blob_cb = cb;
+    g_burst = burst;
+    g_big_at = big_at;
+    g_big_len = big_len;
+    pthread_t t;
+    pthread_create(&t, 0, burster, 0);
+    pthread_detach(t);
+}
 `;
 
 function findCc(): string | null {
@@ -128,6 +164,58 @@ describe("koffi foreign-thread callback delivery repro", () => {
 
             expect(settled).toBe("done");
             expect(received).toEqual([0, 1, 2, 3, 4]);
+        },
+        20_000
+    );
+
+    it.runIf(libPath)(
+        "delivers a rapid burst of callbacks (incl. a large payload) after going idle",
+        async () => {
+            const lib = koffi.load(libPath!);
+            const blobCb = koffi.pointer(
+                koffi.proto("void blob_cb(int seq, uint8 *data, int len)")
+            );
+            const startBurster = lib.func(
+                "void start_burster(blob_cb *cb, int burst, int big_at, int big_len)"
+            );
+
+            const burst = 40;
+            const bigAt = 20;
+            const bigLen = 23638; // same size as the streaming frame that preceded the stall
+            const received: number[] = [];
+            const lengths: number[] = [];
+
+            // Keep-alive timer exactly like FfiRuntimeHost.
+            const keepAlive = setInterval(() => {}, 4);
+
+            const done = new Promise<void>((resolve) => {
+                const cb = koffi.register((seq: number, dataPtr: unknown, len: number) => {
+                    // Decode like feedInbound does, to exercise the same path.
+                    koffi.decode(dataPtr, koffi.array("uint8", len, "Typed"));
+                    received.push(seq);
+                    lengths.push(len);
+                    if (received.length >= burst) {
+                        resolve();
+                    }
+                }, blobCb);
+                startBurster(cb, burst, bigAt, bigLen);
+            });
+
+            const settled = await Promise.race([
+                done.then(() => "done" as const),
+                new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 15_000)),
+            ]);
+
+            clearInterval(keepAlive);
+
+            process.stderr.write(
+                `[repro-burst] received ${received.length}/${burst} (${settled}); ` +
+                    `bigLen=${lengths[bigAt] ?? "n/a"}\n`
+            );
+
+            expect(settled).toBe("done");
+            expect(received.length).toBe(burst);
+            expect(lengths[bigAt]).toBe(bigLen);
         },
         20_000
     );

@@ -203,18 +203,19 @@ export class FfiRuntimeHost {
         this.lib = loadLibrary(libraryPath);
         this.receiveStream = new PassThrough();
         this.sendStream = new Writable({
-            // Write frames via an ASYNCHRONOUS FFI call so the JS event loop is never
-            // blocked inside native code. The runtime can deliver an inbound frame (the
-            // response, or a server→client request) on a secondary thread while this
-            // write is in flight; koffi queues that callback to run when the event loop
-            // gets a turn. A synchronous connection_write would block the single JS
-            // thread for the whole native call, so if the runtime delivered the response
-            // during the write and waited for it to be consumed, main and worker would
-            // deadlock — koffi warns about exactly this. Observed as hung
-            // `session.rpc.permissions.*` round-trips on macOS. Node's Writable serializes
-            // writes (the next write waits for this callback), so frame order is preserved.
+            // Write frames with a SYNCHRONOUS FFI call, matching the .NET host. The
+            // native connection_write copies the bytes and returns; it does not block on
+            // the worker. Using koffi's async (libuv-threadpool) variant here instead
+            // competes for threadpool threads with koffi's inbound callback relay (which
+            // blocks its worker thread per frame via napi_tsfn_blocking), and under load
+            // that starved inbound delivery on macOS. Keep writes synchronous and cheap.
             write: (chunk: Buffer, _encoding, callback) => {
-                this.writeFrame(chunk, callback);
+                try {
+                    this.writeFrame(chunk);
+                    callback();
+                } catch (error) {
+                    callback(error as Error);
+                }
             },
         });
     }
@@ -311,68 +312,26 @@ export class FfiRuntimeHost {
         }
 
         let heartbeat = 0;
-        let pumpInFlight = false;
         this.keepAlive = setInterval(() => {
             if (FFI_TRACE && ++heartbeat % 250 === 0) {
                 ffiTrace(`~tick ${heartbeat} pending=${this.inboundQueue.length}`);
-            }
-            // Issue a cheap async FFI call to keep koffi's asynchronous callback broker
-            // servicing pending inbound frames while idle. Skip if one is still in flight
-            // (a completed call already pumped the broker) or we're tearing down.
-            if (pumpInFlight || this.disposed || !this.connectionId) {
-                return;
-            }
-            pumpInFlight = true;
-            try {
-                this.lib.logDroppedCount.async(() => {
-                    pumpInFlight = false;
-                });
-            } catch {
-                pumpInFlight = false;
             }
         }, FfiRuntimeHost.INBOUND_PUMP_INTERVAL_MS);
     }
 
     private writeSeq = 0;
 
-    private writeFrame(frame: Buffer, callback: (error?: Error | null) => void): void {
+    private writeFrame(frame: Buffer): void {
         if (this.disposed || !this.connectionId) {
-            callback(new Error("The in-process runtime connection is closed."));
-            return;
+            throw new Error("The in-process runtime connection is closed.");
         }
         const seq = ++this.writeSeq;
         ffiTrace(`>>W seq=${seq} len=${frame.length} ${frameTag(frame)}`);
-        // Asynchronous FFI call: runs on a libuv worker thread and invokes this callback
-        // when the native write completes, keeping the JS event loop free to service
-        // inbound native→JS callbacks in the meantime (see the sendStream comment).
-        this.lib.connectionWrite.async(
-            this.connectionId,
-            frame,
-            frame.length,
-            (error: Error | null, result: boolean) => {
-                ffiTrace(`>>WDONE seq=${seq} ok=${!error && result} err=${error?.message ?? "-"}`);
-                // Node-API completion callback: guard so a throw here (e.g. the stream's
-                // own callback rejecting after teardown) can't escape across the FFI
-                // boundary as an uncaught Node-API callback exception (DEP0168).
-                try {
-                    if (error) {
-                        callback(error);
-                    } else if (!result) {
-                        callback(
-                            new Error(
-                                "Failed to write a frame to the in-process runtime connection."
-                            )
-                        );
-                    } else {
-                        callback();
-                    }
-                } catch (callbackError) {
-                    console.error(
-                        `In-process FFI write completion callback failed: ${callbackError instanceof Error ? (callbackError.stack ?? callbackError.message) : String(callbackError)}`
-                    );
-                }
-            }
-        );
+        const ok = this.lib.connectionWrite(this.connectionId, frame, frame.length);
+        ffiTrace(`>>WDONE seq=${seq} ok=${ok}`);
+        if (!ok) {
+            throw new Error("Failed to write a frame to the in-process runtime connection.");
+        }
     }
 
     /**
