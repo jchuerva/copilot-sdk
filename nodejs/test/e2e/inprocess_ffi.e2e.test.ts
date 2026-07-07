@@ -16,6 +16,9 @@ function onTestFinishedForceStop(client: CopilotClient) {
 }
 
 describe("In-process FFI transport", () => {
+    // Mirrors the .NET `Should_Start_And_Connect_Over_InProcess_Ffi`. Resolution of the
+    // in-process transport from COPILOT_SDK_DEFAULT_CONNECTION is exercised by the full
+    // E2E suite running under the `inprocess` CI matrix cell, not a dedicated test.
     it("should start and connect over in-process FFI", async () => {
         // In-process FFI hosting resolves the CLI entrypoint (COPILOT_CLI_PATH or the
         // bundled platform package) and its sibling native runtime library itself. If
@@ -30,20 +33,5 @@ describe("In-process FFI transport", () => {
         expect(Date.parse(pong.timestamp)).not.toBeNaN();
 
         expect(await client.stop()).toHaveLength(0); // No errors on stop
-    });
-
-    it("should resolve the in-process transport from COPILOT_SDK_DEFAULT_CONNECTION", async () => {
-        // No explicit connection: the default is resolved from the env var.
-        const client = new CopilotClient({
-            env: { ...process.env, COPILOT_SDK_DEFAULT_CONNECTION: "inprocess" },
-        });
-        onTestFinishedForceStop(client);
-
-        await client.start();
-
-        const pong = await client.ping("env default");
-        expect(pong.message).toBe("pong: env default");
-
-        expect(await client.stop()).toHaveLength(0);
     });
 });

@@ -120,9 +120,39 @@ export async function createSdkTestContext({
         env: userEnv,
         ...remainingClientOptions
     } = copilotClientOptions ?? {};
+
+    const mergedEnv = { ...env, ...userEnv };
+
+    // The in-process (FFI) transport loads the runtime into this test host process,
+    // and its worker inherits this process's ambient environment rather than a
+    // per-client env block (see https://github.com/github/copilot-sdk/issues/1934).
+    // So the per-test redirects, isolated home, and credentials must be mirrored onto
+    // the real process environment. Node's `process.env` writes reach native `getenv`,
+    // so host-side runtime reads (auth resolution, GitHub API redirect) observe them.
+    // Auth flows via GH_TOKEN/GITHUB_TOKEN here (the FFI argv omits the stdio
+    // `--auth-token-env COPILOT_SDK_AUTH_TOKEN` wiring), and HMAC is disabled so
+    // host-side auth resolution picks the SDK/Bearer token the replay snapshots expect.
+    const isInProcess = connection.kind === "inprocess";
+    const restoreProcessEnv: Array<[string, string | undefined]> = [];
+    if (isInProcess) {
+        const inProcessEnv: Record<string, string> = {
+            ...(mergedEnv as Record<string, string>),
+            GH_TOKEN: authTokenToUse,
+            GITHUB_TOKEN: authTokenToUse,
+            COPILOT_HMAC_KEY: "",
+            CAPI_HMAC_KEY: "",
+        };
+        for (const [key, value] of Object.entries(inProcessEnv)) {
+            restoreProcessEnv.push([key, process.env[key]]);
+            process.env[key] = value;
+        }
+    }
+
     const copilotClient = new CopilotClient({
         workingDirectory: workDir,
-        env: { ...env, ...userEnv },
+        // In-process hosting mirrors the environment onto the real process (above), so
+        // the worker inherits it; passing a per-client env here would have no effect.
+        env: isInProcess ? undefined : mergedEnv,
         logLevel: logLevel || "error",
         connection,
         gitHubToken: authTokenToUse,
@@ -159,6 +189,15 @@ export async function createSdkTestContext({
     afterAll(async () => {
         await copilotClient.stop();
         await openAiEndpoint.stop(anyTestFailed);
+        // Restore any process-environment entries the in-process path mirrored, so
+        // the mutation doesn't leak into other suites sharing this worker process.
+        for (const [key, previous] of restoreProcessEnv.reverse()) {
+            if (previous === undefined) {
+                delete process.env[key];
+            } else {
+                process.env[key] = previous;
+            }
+        }
         await rmDir("remove e2e test copilotHomeDir", copilotHomeDir);
         await rmDir("remove e2e test homeDir", homeDir);
         await rmDir("remove e2e test workDir", workDir);

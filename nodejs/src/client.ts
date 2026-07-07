@@ -2255,10 +2255,11 @@ export class CopilotClient {
     }
 
     /**
-     * Builds the environment for the spawned runtime worker (used by both the stdio/TCP
-     * child process and the in-process FFI host): applies the auth token, connection
-     * token, `COPILOT_HOME`, keychain setting, and telemetry variables on top of the
-     * effective env.
+     * Builds the environment for the spawned runtime child process (stdio/TCP): applies
+     * the auth token, connection token, `COPILOT_HOME`, keychain setting, and telemetry
+     * variables on top of the effective env. Not used by the in-process (FFI) transport,
+     * whose worker inherits the host process's ambient environment
+     * (see {@link CopilotClient.startInProcessFfi}).
      */
     private buildRuntimeEnv(): Record<string, string | undefined> {
         const env: Record<string, string | undefined> = { ...this.resolvedEnv };
@@ -2501,13 +2502,20 @@ export class CopilotClient {
     /**
      * Start the in-process FFI runtime host: resolve the CLI entrypoint and native
      * runtime library, then let the native host spawn the CLI worker.
+     *
+     * The worker inherits this host process's ambient environment; per-client options
+     * that lower to environment variables (`env`, `telemetry`, `gitHubToken`,
+     * `baseDirectory`) are intentionally not applied here, because the native runtime
+     * loads into the shared host process and a single env block cannot carry per-client
+     * values. Configure the in-process runtime via the host process environment instead.
+     * See https://github.com/github/copilot-sdk/issues/1934.
      */
     private async startInProcessFfi(): Promise<void> {
         const entrypoint = this.resolveCliPathForFfi();
         const host = FfiRuntimeHost.create(
             entrypoint,
             CopilotClient.getNapiPrebuildsFolder(),
-            this.buildRuntimeEnv(),
+            undefined,
             this.options.workingDirectory
         );
         this.ffiHost = host;
