@@ -125,13 +125,25 @@ export class FfiRuntimeHost {
     private disposed = false;
     private outboundCallback: KoffiRegisteredCallback | undefined;
     /**
-     * Keeps the libuv event loop alive while the FFI connection is open. Unlike the
-     * stdio/TCP transports (whose pipe/socket handles keep the loop alive), the FFI
-     * transport has no libuv handle of its own, and native→JS callbacks are delivered
-     * via the event loop. Without a live handle the loop can park with no work and the
-     * queued callback delivery races into a crash.
+     * Keeps the libuv event loop alive AND turning while the FFI connection is open.
+     * Unlike the stdio/TCP transports (whose pipe/socket handles keep the loop alive),
+     * the FFI transport has no libuv handle of its own, and native→JS callbacks
+     * (inbound server→client frames) are delivered via the event loop. Without a live
+     * handle the loop can park with no work, and koffi's cross-thread callback delivery
+     * is only serviced when the loop next turns.
+     *
+     * The interval is deliberately short: when the SDK issues a bare request and then
+     * only `await`s the response (e.g. `session.rpc.permissions.*`), there is no other
+     * loop activity, so a coarse interval let the loop sleep and the inbound response
+     * frame sat undelivered until the next tick — on macOS this stalled such round-trips
+     * past the test timeout (streaming turns kept the loop busy and so were unaffected).
+     * A few-millisecond tick keeps inbound delivery prompt; the empty callback is cheap
+     * and only runs while a connection is open. This is the koffi analogue of the .NET
+     * host's thread-safe `Channel` callback, which wakes its reader immediately.
      */
     private keepAlive: ReturnType<typeof setInterval> | null = null;
+    /** Interval (ms) for {@link keepAlive}; short so inbound frames are pumped promptly. */
+    private static readonly INBOUND_PUMP_INTERVAL_MS = 4;
 
     /** The stream JSON-RPC reads server→client frames from. */
     readonly receiveStream: PassThrough;
@@ -249,7 +261,7 @@ export class FfiRuntimeHost {
             throw new Error("copilot_runtime_connection_open failed.");
         }
 
-        this.keepAlive = setInterval(() => {}, 60_000);
+        this.keepAlive = setInterval(() => {}, FfiRuntimeHost.INBOUND_PUMP_INTERVAL_MS);
     }
 
     private writeFrame(frame: Buffer): void {
