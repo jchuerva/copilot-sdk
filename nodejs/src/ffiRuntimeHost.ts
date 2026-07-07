@@ -66,6 +66,7 @@ interface FfiLibrary {
     connectionOpen: KoffiFunction;
     connectionWrite: KoffiFunction;
     connectionClose: KoffiFunction;
+    logDroppedCount: KoffiFunction;
     outboundCallbackType: KoffiType;
 }
 
@@ -119,6 +120,10 @@ function loadLibrary(libraryPath: string): FfiLibrary {
             "size_t",
         ]),
         connectionClose: lib.func(`${SYMBOL_PREFIX}connection_close`, "bool", ["uint32"]),
+        // A no-argument, side-effect-free diagnostic getter (returns a dropped-log
+        // counter). Used purely as a cheap async FFI call to keep koffi's asynchronous
+        // callback broker pumping while the connection is idle (see the pump in start()).
+        logDroppedCount: lib.func(`${SYMBOL_PREFIX}log_dropped_count`, "uint64", []),
         outboundCallbackType,
     };
     loadedLibraryPath = libraryPath;
@@ -157,24 +162,24 @@ export class FfiRuntimeHost {
     private disposed = false;
     private outboundCallback: KoffiRegisteredCallback | undefined;
     /**
-     * Keeps the libuv event loop alive AND turning while the FFI connection is open.
-     * Unlike the stdio/TCP transports (whose pipe/socket handles keep the loop alive),
-     * the FFI transport has no libuv handle of its own, and native→JS callbacks
-     * (inbound server→client frames) are delivered via the event loop. Without a live
-     * handle the loop can park with no work, and koffi's cross-thread callback delivery
-     * is only serviced when the loop next turns.
+     * Keeps koffi's asynchronous callback broker pumping while the connection is open,
+     * so inbound native→JS frames are delivered promptly even when the SDK is otherwise
+     * idle (waiting on a bare request/response).
      *
-     * The interval is deliberately short: when the SDK issues a bare request and then
-     * only `await`s the response (e.g. `session.rpc.permissions.*`), there is no other
-     * loop activity, so a coarse interval let the loop sleep and the inbound response
-     * frame sat undelivered until the next tick — on macOS this stalled such round-trips
-     * past the test timeout (streaming turns kept the loop busy and so were unaffected).
-     * A few-millisecond tick keeps inbound delivery prompt; the empty callback is cheap
-     * and only runs while a connection is open. This is the koffi analogue of the .NET
-     * host's thread-safe `Channel` callback, which wakes its reader immediately.
+     * The runtime invokes our outbound callback from a secondary thread. koffi marshals
+     * such foreign-thread callbacks to the JS main thread, but only services that queue
+     * while a koffi asynchronous FFI call is in flight — during streaming, the constant
+     * `connectionWrite.async` traffic keeps it pumped, but once the SDK goes idle after
+     * a single request a plain timer keeps the event loop alive WITHOUT pumping koffi's
+     * broker, so the response frame sits undelivered until the next koffi async call
+     * (observed as 30s-timeout hangs of bare `session.rpc.*` round-trips, most visibly on
+     * macOS/Windows). Issuing a cheap async FFI call on a short interval keeps the broker
+     * serviced. This is the koffi analogue of the .NET host's raw function-pointer
+     * callback, which needs no event-loop pumping because it runs directly on the runtime
+     * thread into a thread-safe `Channel`.
      */
     private keepAlive: ReturnType<typeof setInterval> | null = null;
-    /** Interval (ms) for {@link keepAlive}; short so inbound frames are pumped promptly. */
+    /** Interval (ms) between async broker pumps; short so idle round-trips stay prompt. */
     private static readonly INBOUND_PUMP_INTERVAL_MS = 4;
     /**
      * Inbound frame bytes copied out of the native callback, awaiting delivery to
@@ -306,9 +311,24 @@ export class FfiRuntimeHost {
         }
 
         let heartbeat = 0;
+        let pumpInFlight = false;
         this.keepAlive = setInterval(() => {
             if (FFI_TRACE && ++heartbeat % 250 === 0) {
                 ffiTrace(`~tick ${heartbeat} pending=${this.inboundQueue.length}`);
+            }
+            // Issue a cheap async FFI call to keep koffi's asynchronous callback broker
+            // servicing pending inbound frames while idle. Skip if one is still in flight
+            // (a completed call already pumped the broker) or we're tearing down.
+            if (pumpInFlight || this.disposed || !this.connectionId) {
+                return;
+            }
+            pumpInFlight = true;
+            try {
+                this.lib.logDroppedCount.async(() => {
+                    pumpInFlight = false;
+                });
+            } catch {
+                pumpInFlight = false;
             }
         }, FfiRuntimeHost.INBOUND_PUMP_INTERVAL_MS);
     }
