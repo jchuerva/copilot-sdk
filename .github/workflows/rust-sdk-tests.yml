@@ -137,13 +137,19 @@ jobs:
   # E2E suite over the in-process transport. The suite runs serially in-process
   # (the harness forces concurrency to 1) because it mirrors each test's
   # environment onto the shared process environment the in-process worker inherits.
+  # Windows is excluded (matching dotnet-sdk-tests.yml) pending in-process SQLite
+  # file-locking on shutdown.
   test-inprocess:
-    name: "Rust SDK Tests (ubuntu-latest, inprocess)"
+    name: "Rust SDK Tests (${{ matrix.os }}, inprocess)"
     if: github.event.repository.fork == false
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
@@ -177,7 +183,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ./rust/.bundled-cli-cache
-          key: bundled-cli-ubuntu-latest-${{ steps.cli-version.outputs.version }}
+          key: bundled-cli-${{ matrix.os }}-${{ steps.cli-version.outputs.version }}
 
       - name: Install test harness dependencies
         working-directory: ./test/harness
@@ -192,9 +198,10 @@ jobs:
           COPILOT_HMAC_KEY: ${{ secrets.COPILOT_DEVELOPER_CLI_INTEGRATION_HMAC_KEY }}
           COPILOT_CLI_PATH: ${{ steps.setup-copilot.outputs.cli-path }}
           BUNDLED_CLI_CACHE_DIR: ${{ github.workspace }}/rust/.bundled-cli-cache
-        # The harness forces serial execution in-process, so RUST_E2E_CONCURRENCY is
-        # intentionally not set here.
-        run: cargo test --no-default-features --features test-support --test e2e -- --nocapture
+        # The harness forces serial execution in-process (both the async semaphore and
+        # libtest via --test-threads=1) because it mirrors each test's environment onto
+        # the shared process environment, so RUST_E2E_CONCURRENCY is not set here.
+        run: cargo test --no-default-features --features test-support --test e2e -- --test-threads=1 --nocapture
 
   # Validates the bundled-CLI build path on all three supported
   # platforms. While the regular `cargo test` job above also exercises
