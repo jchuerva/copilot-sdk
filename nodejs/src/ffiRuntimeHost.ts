@@ -37,6 +37,7 @@ interface FfiLibrary {
     connectionOpen: KoffiFunction;
     connectionWrite: KoffiFunction;
     connectionClose: KoffiFunction;
+    logDroppedCount: KoffiFunction;
     outboundCallbackType: KoffiType;
 }
 
@@ -90,6 +91,10 @@ function loadLibrary(libraryPath: string): FfiLibrary {
             "size_t",
         ]),
         connectionClose: lib.func(`${SYMBOL_PREFIX}connection_close`, "bool", ["uint32"]),
+        // A no-argument, side-effect-free diagnostic getter (returns a dropped-log
+        // counter). Used purely as a cheap async FFI call to keep koffi's asynchronous
+        // callback broker serviced while the connection is idle (see the pump in start()).
+        logDroppedCount: lib.func(`${SYMBOL_PREFIX}log_dropped_count`, "uint64", []),
         outboundCallbackType,
     };
     loadedLibraryPath = libraryPath;
@@ -128,14 +133,28 @@ export class FfiRuntimeHost {
     private disposed = false;
     private outboundCallback: KoffiRegisteredCallback | undefined;
     /**
-     * Keeps the libuv event loop alive while the FFI connection is open. Unlike the
-     * stdio/TCP transports (whose pipe/socket handles keep the loop alive), the FFI
-     * transport has no libuv handle of its own; without a live handle the loop could
-     * park with no work while awaiting inbound native→JS frames.
+     * Keeps koffi's asynchronous callback broker serviced while the FFI connection is
+     * open, so inbound native→JS frames are delivered promptly even when the SDK is
+     * otherwise idle (e.g. awaiting a model response with no client→server writes in
+     * flight).
+     *
+     * The runtime invokes our outbound callback from a worker thread. koffi marshals
+     * such foreign-thread callbacks to the JS main thread via a threadsafe-function
+     * "broker" that is only serviced WHILE a koffi asynchronous FFI call is in flight —
+     * a plain JS timer (setInterval) does NOT pump it. During active request/response
+     * traffic the constant `connection_write` calls keep frames flowing, but once the
+     * SDK goes idle mid-turn (e.g. the worker is awaiting a model HTTP response, so
+     * there are no client→server writes) the broker parks and the next outbound frame
+     * (the model response, then everything after it) sits undelivered until the next
+     * koffi call — observed as a permanent 30s stall of otherwise-healthy sessions on
+     * macOS/Windows (libuv services the broker differently on Linux, which is why it
+     * only reproduces off-Linux). Keeping exactly one cheap async FFI call
+     * (`log_dropped_count`) continuously in flight keeps the broker pumping so
+     * foreign-thread frames are always delivered. This is the koffi analogue of the
+     * .NET host's raw function-pointer callback, which runs directly on the runtime
+     * thread and needs no event-loop pumping.
      */
-    private keepAlive: ReturnType<typeof setInterval> | null = null;
-    /** Interval (ms) for the keep-alive timer. */
-    private static readonly KEEPALIVE_INTERVAL_MS = 1000;
+    private pumpActive = false;
     /**
      * Inbound frame bytes copied out of the native callback, awaiting delivery to
      * {@link receiveStream} on a clean event-loop tick. See {@link feedInbound}.
@@ -262,15 +281,35 @@ export class FfiRuntimeHost {
             throw new Error("copilot_runtime_connection_open failed.");
         }
 
-        let ticks = 0;
-        this.keepAlive = setInterval(() => {
-            if (FFI_TRACE) {
-                ticks++;
-                process.stderr.write(
-                    `[ffi ${Date.now() % 100000} pid=${process.pid}] TICK ${ticks} inboundSeq=${this.inboundSeq} qlen=${this.inboundQueue.length}\n`
-                );
+        this.startBrokerPump();
+    }
+
+    /**
+     * Keeps exactly one cheap async FFI call in flight at all times so koffi's
+     * threadsafe-function broker stays serviced and foreign-thread outbound callbacks
+     * are delivered without waiting for the next client→server write. Each call
+     * reschedules the next on completion; the in-flight libuv request also keeps the
+     * event loop alive (replacing the old keep-alive timer). Stops when disposed.
+     */
+    private startBrokerPump(): void {
+        if (this.pumpActive) {
+            return;
+        }
+        this.pumpActive = true;
+        const pump = (): void => {
+            if (this.disposed || !this.connectionId) {
+                this.pumpActive = false;
+                return;
             }
-        }, FfiRuntimeHost.KEEPALIVE_INTERVAL_MS);
+            this.lib.logDroppedCount.async((_error: Error | null, _result: unknown) => {
+                if (this.disposed || !this.connectionId) {
+                    this.pumpActive = false;
+                    return;
+                }
+                pump();
+            });
+        };
+        pump();
     }
 
     private writeFrame(frame: Buffer): void {
@@ -391,10 +430,9 @@ export class FfiRuntimeHost {
         }
         this.disposed = true;
 
-        if (this.keepAlive) {
-            clearInterval(this.keepAlive);
-            this.keepAlive = null;
-        }
+        // The broker pump observes `disposed` and stops rescheduling on its next
+        // completion; no timer to clear.
+        this.pumpActive = false;
 
         try {
             if (this.connectionId) {
