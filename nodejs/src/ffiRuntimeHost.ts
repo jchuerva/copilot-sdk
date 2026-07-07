@@ -144,6 +144,13 @@ export class FfiRuntimeHost {
     private keepAlive: ReturnType<typeof setInterval> | null = null;
     /** Interval (ms) for {@link keepAlive}; short so inbound frames are pumped promptly. */
     private static readonly INBOUND_PUMP_INTERVAL_MS = 4;
+    /**
+     * Inbound frame bytes copied out of the native callback, awaiting delivery to
+     * {@link receiveStream} on a clean event-loop tick. See {@link feedInbound}.
+     */
+    private readonly inboundQueue: Buffer[] = [];
+    /** Whether a drain of {@link inboundQueue} is already scheduled. */
+    private drainScheduled = false;
 
     /** The stream JSON-RPC reads server→client frames from. */
     readonly receiveStream: PassThrough;
@@ -273,13 +280,44 @@ export class FfiRuntimeHost {
         }
     }
 
+    /**
+     * Native outbound callback: copies the inbound frame bytes and hands them to the
+     * event loop for delivery, WITHOUT driving the JSON-RPC reader synchronously here.
+     *
+     * The native pointer is only valid for the duration of this call, so the bytes are
+     * decoded/copied eagerly; but writing them to {@link receiveStream} (which
+     * synchronously drives frame parsing and JSON-RPC dispatch, and may re-enter the
+     * SDK's write path) is deferred to a `setImmediate` drain on a clean stack. This
+     * keeps the callback minimal and non-reentrant — the koffi analogue of the .NET
+     * host's thread-safe `Channel` callback, which enqueues and returns immediately.
+     * Delivering synchronously here could re-enter a native `connection_write` call
+     * still on the stack and deadlock (observed as hung `session.rpc.*` round-trips
+     * on macOS).
+     */
     private feedInbound(bytesPtr: unknown, bytesLen: number | bigint): void {
         const length = Number(bytesLen);
         if (!bytesPtr || length <= 0) {
             return;
         }
         const bytes = koffi.decode(bytesPtr, koffi.array("uint8", length, "Typed")) as Uint8Array;
-        this.receiveStream.write(Buffer.from(bytes));
+        this.inboundQueue.push(Buffer.from(bytes));
+        if (!this.drainScheduled) {
+            this.drainScheduled = true;
+            setImmediate(() => this.drainInbound());
+        }
+    }
+
+    /** Delivers queued inbound frames to {@link receiveStream} on a clean event-loop tick. */
+    private drainInbound(): void {
+        this.drainScheduled = false;
+        if (this.disposed) {
+            this.inboundQueue.length = 0;
+            return;
+        }
+        let frame: Buffer | undefined;
+        while ((frame = this.inboundQueue.shift()) !== undefined) {
+            this.receiveStream.write(frame);
+        }
     }
 
     private unregisterCallback(): void {
