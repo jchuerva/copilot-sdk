@@ -427,6 +427,14 @@ describe("Permission callbacks", async () => {
 
         await permissionCalled;
 
+        // Abort the in-flight turn before tearing down, mirroring the .NET test
+        // (Should_Deny_Permission_With_NoResult_Kind uses AbortAsync). With no-result
+        // the SDK never answers the CLI's permission request, so the tool call stays
+        // in-flight; over the in-process transport the runtime worker is shared across
+        // sessions, and destroying a session with a dangling permission round-trip
+        // (via disconnect) wedges the worker for subsequent sessions. Aborting cancels
+        // the pending turn cleanly first.
+        await session.abort();
         await session.disconnect();
     });
 

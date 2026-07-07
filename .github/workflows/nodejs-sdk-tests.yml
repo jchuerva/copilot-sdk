@@ -118,9 +118,6 @@ jobs:
         env:
           COPILOT_HMAC_KEY: ${{ secrets.COPILOT_DEVELOPER_CLI_INTEGRATION_HMAC_KEY }}
         run: |
-          echo "ulimit -n before: $(ulimit -n)"
-          ulimit -n 8192 || true
-          echo "ulimit -n after: $(ulimit -n)"
           if [ -n "$TEST_NAME_FILTER" ]; then
             npx vitest run "$TEST_TARGET" -t "$TEST_NAME_FILTER"
           else
