@@ -155,19 +155,27 @@ export class FfiRuntimeHost {
         this.lib = loadLibrary(libraryPath);
         this.receiveStream = new PassThrough();
         this.sendStream = new Writable({
-            // Write frames with a SYNCHRONOUS FFI call, matching the .NET host. The
-            // native connection_write copies the bytes and returns; it does not block on
-            // the worker. Using koffi's async (libuv-threadpool) variant here instead
-            // competes for threadpool threads with koffi's inbound callback relay (which
-            // blocks its worker thread per frame via napi_tsfn_blocking), and under load
-            // that starved inbound delivery on macOS. Keep writes synchronous and cheap.
+            // Write frames with an ASYNCHRONOUS FFI call. This is the crux of Node
+            // in-process parity with .NET. koffi delivers the runtime's outbound
+            // (worker->SDK) callback by marshalling it to the JS main thread and BLOCKING
+            // the cdylib's reader thread (napi_tsfn_blocking) until JS runs it — unlike
+            // .NET's raw fn-pointer callback, which runs inline on the reader thread with
+            // a non-blocking Channel.TryWrite and never blocks. If we also ran
+            // connection_write SYNCHRONOUSLY on the JS main thread, a burst of inbound
+            // frames could deadlock: the reader thread blocks in the callback for frame B
+            // (awaiting JS) while the JS main thread blocks in a synchronous
+            // connection_write triggered by dispatching frame A (awaiting the reader
+            // thread) — a bidirectional wedge observed as permanently stalled inbound
+            // delivery on macOS/Windows (e.g. a session.destroy issued with a permission
+            // round-trip still in flight). Issuing the write asynchronously (libuv
+            // threadpool) keeps the JS main thread free to service the inbound callback,
+            // so the reader thread never stays blocked. Node's Writable serializes writes
+            // (one in flight, next only after callback), so frame order is preserved.
             write: (chunk: Buffer, _encoding, callback) => {
-                try {
-                    this.writeFrame(chunk);
-                    callback();
-                } catch (error) {
-                    callback(error as Error);
-                }
+                this.writeFrame(chunk).then(
+                    () => callback(),
+                    (error) => callback(error as Error)
+                );
             },
         });
     }
@@ -266,14 +274,30 @@ export class FfiRuntimeHost {
         this.keepAlive = setInterval(() => {}, FfiRuntimeHost.KEEPALIVE_INTERVAL_MS);
     }
 
-    private writeFrame(frame: Buffer): void {
+    private writeFrame(frame: Buffer): Promise<void> {
         if (this.disposed || !this.connectionId) {
-            throw new Error("The in-process runtime connection is closed.");
+            return Promise.reject(new Error("The in-process runtime connection is closed."));
         }
-        const ok = this.lib.connectionWrite(this.connectionId, frame, frame.length);
-        if (!ok) {
-            throw new Error("Failed to write a frame to the in-process runtime connection.");
-        }
+        return new Promise<void>((resolvePromise, rejectPromise) => {
+            this.lib.connectionWrite.async(
+                this.connectionId,
+                frame,
+                frame.length,
+                (error: Error | null, ok: boolean) => {
+                    if (error) {
+                        rejectPromise(error);
+                    } else if (!ok) {
+                        rejectPromise(
+                            new Error(
+                                "Failed to write a frame to the in-process runtime connection."
+                            )
+                        );
+                    } else {
+                        resolvePromise();
+                    }
+                }
+            );
+        });
     }
 
     /**
