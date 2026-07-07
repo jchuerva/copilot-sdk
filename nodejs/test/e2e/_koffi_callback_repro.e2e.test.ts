@@ -86,6 +86,40 @@ void start_burster(blob_cb cb, int burst, int big_at, int big_len) {
     pthread_create(&t, 0, burster, 0);
     pthread_detach(t);
 }
+
+// Bidirectional reentrancy repro. A background "reader" thread invokes an inbound
+// callback for each frame; the JS callback may synchronously call back into
+// 'sink' (mimicking the SDK's synchronous connection_write from inside the koffi
+// inbound callback). Because koffi relays foreign-thread callbacks with
+// napi_tsfn_blocking, the reader thread is blocked in the callback while JS runs —
+// and JS re-enters native via 'sink' on the main thread. This is the exact
+// native->JS->native reentrancy the in-process transport performs under streaming.
+typedef void (*inbound_cb)(int seq);
+
+static inbound_cb g_inbound;
+static int g_frames;
+static volatile int g_sink_count;
+
+// Called by JS from inside the inbound callback (like connection_write). Cheap.
+void sink(int seq) { (void)seq; g_sink_count++; }
+
+static void *reader(void *arg) {
+    (void)arg;
+    usleep(150 * 1000);
+    for (int i = 0; i < g_frames; i++) {
+        if (g_inbound) g_inbound(i); // blocks until the JS callback returns
+    }
+    return 0;
+}
+
+void start_reader(inbound_cb cb, int frames) {
+    g_inbound = cb;
+    g_frames = frames;
+    g_sink_count = 0;
+    pthread_t t;
+    pthread_create(&t, 0, reader, 0);
+    pthread_detach(t);
+}
 `;
 
 function findCc(): string | null {
@@ -216,6 +250,51 @@ describe("koffi foreign-thread callback delivery repro", () => {
             expect(settled).toBe("done");
             expect(received.length).toBe(burst);
             expect(lengths[bigAt]).toBe(bigLen);
+        },
+        20_000
+    );
+
+    it.runIf(libPath)(
+        "delivers frames when the JS callback re-enters native synchronously",
+        async () => {
+            const lib = koffi.load(libPath!);
+            const inboundCb = koffi.pointer(koffi.proto("void inbound_cb(int seq)"));
+            const startReader = lib.func("void start_reader(inbound_cb *cb, int frames)");
+            // Synchronous native call issued from inside the inbound callback, mimicking
+            // the SDK's synchronous connection_write from inside feedInbound.
+            const sink = lib.func("void sink(int seq)");
+
+            const frames = 60;
+            const received: number[] = [];
+
+            const keepAlive = setInterval(() => {}, 4);
+
+            const done = new Promise<void>((resolve) => {
+                const cb = koffi.register((seq: number) => {
+                    // Re-enter native synchronously while this callback (running on, and
+                    // blocking, the reader thread relay) is on the stack.
+                    sink(seq);
+                    received.push(seq);
+                    if (received.length >= frames) {
+                        resolve();
+                    }
+                }, inboundCb);
+                startReader(cb, frames);
+            });
+
+            const settled = await Promise.race([
+                done.then(() => "done" as const),
+                new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 15_000)),
+            ]);
+
+            clearInterval(keepAlive);
+
+            process.stderr.write(
+                `[repro-reentrant] received ${received.length}/${frames} (${settled})\n`
+            );
+
+            expect(settled).toBe("done");
+            expect(received.length).toBe(frames);
         },
         20_000
     );
