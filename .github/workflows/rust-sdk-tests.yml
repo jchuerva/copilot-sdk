@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   test:
-    name: "Rust SDK Tests"
+    name: "Rust SDK Tests (${{ matrix.os }}, default)"
     if: github.event.repository.fork == false
     env:
       POWERSHELL_UPDATECHECK: Off
@@ -138,7 +138,7 @@ jobs:
   # (the harness forces concurrency to 1) because it mirrors each test's
   # environment onto the shared process environment the in-process worker inherits.
   test-inprocess:
-    name: "Rust SDK Tests (in-process transport)"
+    name: "Rust SDK Tests (ubuntu-latest, inprocess)"
     if: github.event.repository.fork == false
     env:
       CARGO_TERM_COLOR: always
@@ -203,7 +203,7 @@ jobs:
   # extract / embed pipeline. Catches regressions before they ship to
   # crates.io and before bundling consumers hit them downstream.
   bundle:
-    name: "Rust SDK Bundled CLI Build"
+    name: "Rust SDK Bundled CLI Build (${{ matrix.os }})"
     if: github.event.repository.fork == false
     env:
       CARGO_TERM_COLOR: always
